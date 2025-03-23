@@ -373,11 +373,91 @@ if __name__ == '__main__':
                 
                 # train_loader_gaze에서 데이터를 하나씩 배치 단위로 가져와 학습하는 루프
                 for i, (images_gaze, labels_gaze, cont_labels_gaze, name) in enumerate(train_loader_gaze):
+                    # train_loader로 커스텀된 데이터를 가져왔음.
+                    # image_gaze에는 이미지 자체가, labels_gaze에는 도 단위의 gaze2d정보를 라디안으로 변경한 뒤 bin에 넣은 값, 
+                    # cont_labels_gaze에는 도 단위의 gaze2d정보를 라디안으로 변경한 값, name에는 이미지 이름이 대응되어서 가져와진 것
+                    
                     images_gaze = Variable(images_gaze).cuda(gpu)
                     # image_gaze는 입력 이미지 데이터를 의미하며, gpu에 이미지를 올려서 모델이 처리할 수 있도록 함
 
                     # Binned labels
                     # pitch와 yaw가 어느 bin에 속하는지에 대한 라벨
+                    # labels_gaze[:, 0] 은 numpy배열의 모든 행 중, 0번째 열의 값들을 가져오겠다는 뜻. 여기선 labels_gaze가 1차원 배열이라 크냥            # 즉, -42도부터 42도까지 3도 간격으로 나누면 28개가 됨. 왜 42냐고? 논문에서 사람 시야가 그 정도래.
+            # model엔 L2CS 모델을, pre_url엔 backbone 모델(resnet)을 가져오는 것.
+            
+            load_filtered_state_dict(model, model_zoo.load_url(pre_url))
+            # 이건 미리 학습된 모델을 불러오는 것. model_zoo.load_url은 미리 학습된 모델을 불러오는 함수.
+            # 즉, resnet을 불러와서 L2CS 모델에 넣어줌.
+            
+            model = nn.DataParallel(model)
+            # DataParallel은 여러 GPU를 사용하여 모델을 병렬로 실행할 수 있게 해주는 것.
+            
+            model.to(gpu)
+            print('Loading data.')
+            dataset=Mpiigaze(testlabelpathombined, args.gazeMpiimage_dir, transformations, True, 180, fold)
+            # Mpiigaze는 데이터셋 클래스로, 데이터셋을 불러오는 역할을 함.
+            # testlabelpathombined는 라벨이 있는 경로, args.gazeMpiimage_dir는 이미지가 있는 경로, transformations는 데이터 전처리를 위한 것.
+            # True는 훈련 데이터셋을 불러오는 것이라는 것을 의미함.
+            # fold는 leave-one-person-out을 위한 것.
+            
+            train_loader_gaze = DataLoader( # DataLoader는 데이터셋을 불러오는 역할을 함.
+                dataset=dataset, 
+                batch_size=int(batch_size),
+                shuffle=True, # 데이터를 섞을 것인지에 대한 것.
+                num_workers=4, # 데이터를 불러올 때 사용할 프로세스 수.
+                pin_memory=True) # 데이터를 불러올 때 메모리를 고정할 것인지에 대한 것. 데이터를 고정하면 데이터를 불러올 때 빠르게 불러올 수 있음.
+            torch.backends.cudnn.benchmark = True
+            # cudnn은 NVIDIA에서 제공하는 딥러닝 라이브러리로, 딥러닝 모델을 빠르게 학습할 수 있도록 도와줌.
+            # benchmark는 cudnn을 사용할 때 최적화를 위해 사용하는 것.
+            
+            summary_name = '{}_{}'.format('L2CS-mpiigaze', int(time.time()))
+
+            if not os.path.exists(os.path.join(output+'/{}'.format(summary_name),'fold' + str(fold))):
+                os.makedirs(os.path.join(output+'/{}'.format(summary_name),'fold' + str(fold)))
+
+            criterion = nn.CrossEntropyLoss().cuda(gpu) # criterion은 손실 함수를 의미함.
+            reg_criterion = nn.MSELoss().cuda(gpu) # reg_criterion은 회귀 손실 함수를 의미함.
+            softmax = nn.Softmax(dim=1).cuda(gpu)
+            idx_tensor = [idx for idx in range(28)] # idx_tensor는 각도를 나누는 것. 왜 28개냐면 28개의 bin이 있으니까.
+            idx_tensor = Variable(torch.FloatTensor(idx_tensor)).cuda(gpu)
+            # torch.FloatTensor는 torch.Tensor를 float형으로 변환하는 것.
+            # torch.autograd.Variable은 역전파 연산을 위한 자동 미분을 지원하는 Tensor를 감싸는 클래스.
+            # 지금은 deprecated되었지만, 여전히 사용 가능함.
+
+            # Optimizer gaze
+            optimizer_gaze = torch.optim.Adam([
+                # {'params': get_ignored_params(model, args.arch), 'lr': 0},
+                # {'params': get_non_ignored_params(model, args.arch), 'lr': args.lr},
+                # {'params': get_fc_params(model, args.arch), 'lr': args.lr}
+                {'params': get_ignored_params_mpii(model), 'lr': 0},
+                {'params': get_non_ignored_params_mpii(model), 'lr': args.lr},
+                {'params': get_fc_params_mpii(model), 'lr': args.lr}
+            ], args.lr)
+            # torch.optim.Adam은 Adam 최적화 알고리즘을 사용하는 것.
+            # get_ignored_params, get_non_ignored_params, get_fc_params는 각각 무시할 파라미터, 최적화할 파라미터, fc 레이어 파라미터를 가져오는 것.
+            # Adam 알고리즘은 쉽게 말하면 momentum과 RMSprop을 합친 것.
+            # momentum은 관성을 의미하고, RMSprop은 학습률을 조절하는 것.
+            
+            configuration = f"\ntrain configuration, gpu_id={args.gpu_id}, batch_size={batch_size}, model_arch={args.arch}\n Start training dataset={data_set}, loader={len(train_loader_gaze)}, fold={fold}--------------\n"
+            print(configuration)
+            for epoch in range(num_epochs): # epoch만큼 반복
+                sum_loss_pitch_gaze = sum_loss_yaw_gaze = iter_gaze = 0
+                # sum_loss_pitch_gaze, sum_loss_yaw_gaze는 각각 pitch와 yaw의 손실을 의미함.
+                # iter_gaze는 반복 횟수를 의미함. 나중에 평균 loss 계산에 사용함.
+                
+                # train_loader_gaze에서 데이터를 하나씩 배치 단위로 가져와 학습하는 루프
+                for i, (images_gaze, labels_gaze, cont_labels_gaze, name) in enumerate(train_loader_gaze):
+                    # train_loader로 커스텀된 데이터를 가져왔음.
+                    # image_gaze에는 이미지 자체가, labels_gaze에는 도 단위의 gaze2d정보를 라디안으로 변경한 뒤 bin에 넣은 값, 
+                    # cont_labels_gaze에는 도 단위의 gaze2d정보를 라디안으로 변경한 값, name에는 이미지 이름이 대응되어서 가져와진 것
+                    
+                    images_gaze = Variable(images_gaze).cuda(gpu)
+                    # image_gaze는 입력 이미지 데이터를 의미하며, gpu에 이미지를 올려서 모델이 처리할 수 있도록 함
+
+                    # Binned labels
+                    # pitch와 yaw가 어느 bin에 속하는지에 대한 라벨
+                    # labels_gaze[:, 0] 은 numpy배열의 모든 행 중, 0번째 열의 값들을 가져오겠다는 뜻. 
+                    # 여기선 labels_gaze가 1차원 배열(vector)이라 그냥 벡터 중 0번째 값을 가져왔다고 보면 됨.
                     label_pitch_gaze = Variable(labels_gaze[:, 0]).cuda(gpu)
                     label_yaw_gaze = Variable(labels_gaze[:, 1]).cuda(gpu)
 
