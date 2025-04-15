@@ -1,6 +1,8 @@
 import os
 import argparse
 import time
+import logging
+from tqdm import tqdm
 
 import torch.utils.model_zoo as model_zoo
 import torch
@@ -191,13 +193,24 @@ if __name__ == '__main__':
         if args.snapshot == '':
             load_filtered_state_dict(model, model_zoo.load_url(pre_url))
         else:
-            saved_state_dict = torch.load(args.snapshot)
+            saved_state_dict = torch.load(args.snapshot, weights_only=False)
             model.load_state_dict(saved_state_dict)
         
+        summary_name = '{}_{}'.format('L2CS-gaze360-', int(time.time()))
+        output=os.path.join(output, summary_name)
+        if not os.path.exists(output):
+            os.makedirs(output)
+
+        output_log = os.path.join(output, "training_log.txt")
+        logging.basicConfig(filename=output_log, level=logging.DEBUG, 
+                    format="[ %(asctime)s | %(levelname)s ] %(message)s", 
+                    datefmt="%Y-%m-%d %H:%M:%S")
+
+        logger = logging.getLogger()
         
         model.cuda(gpu)
         dataset=Gaze360(args.gaze360label_dir, args.gaze360image_dir, transformations, 180, 4)
-        print('Loading data.')
+        logging.info('Loading data.')
         train_loader_gaze = DataLoader(
             dataset=dataset,
             batch_size=int(batch_size),
@@ -205,12 +218,6 @@ if __name__ == '__main__':
             num_workers=0,
             pin_memory=True)
         torch.backends.cudnn.benchmark = True
-
-        summary_name = '{}_{}'.format('L2CS-gaze360-', int(time.time()))
-        output=os.path.join(output, summary_name)
-        if not os.path.exists(output):
-            os.makedirs(output)
-
         
         criterion = nn.CrossEntropyLoss().cuda(gpu)
         reg_criterion = nn.MSELoss().cuda(gpu)
@@ -226,77 +233,88 @@ if __name__ == '__main__':
             {'params': get_fc_params(model), 'lr': args.lr}
         ], args.lr)
 
-        configuration = f"\ntrain configuration, gpu_id={args.gpu_id}, batch_size={batch_size}, model_arch={args.arch}\nStart testing dataset={data_set}, loader={len(train_loader_gaze)}------------------------- \n"
-        print(configuration)
+        configuration = "\n--------------------------------------------------------------------------------------------------------------------------\n" + \
+            f"Train configuration: \ngpu_id={args.gpu_id}, batch_size={batch_size}, model_arch={args.arch}, alpha={args.alpha}, lr={args.lr}\nStart training with dataset={data_set} and loader={len(train_loader_gaze)}\n" + \
+            "--------------------------------------------------------------------------------------------------------------------------\n"
+        logging.info(configuration)
         for epoch in range(num_epochs):
-            sum_loss_pitch_gaze = sum_loss_yaw_gaze = iter_gaze = 0
-
+            epoch_loss_pitch_gaze = epoch_loss_yaw_gaze = 0
+            interval_loss_pitch_gaze = interval_loss_yaw_gaze = 0
+            interval = 100
+            num_batches = len(dataset)//batch_size
             
-            for i, (images_gaze, labels_gaze, cont_labels_gaze,name) in enumerate(train_loader_gaze):
-                images_gaze = Variable(images_gaze).cuda(gpu)
-                
-                # Binned labels
-                label_pitch_gaze = Variable(labels_gaze[:, 0]).cuda(gpu)
-                label_yaw_gaze = Variable(labels_gaze[:, 1]).cuda(gpu)
+            with tqdm(train_loader_gaze, unit="batch") as tepoch:
+                for iter_gaze, (images_gaze, labels_gaze, cont_labels_gaze,name) in enumerate(tepoch):
+                    tepoch.set_description(f"Training Epoch {epoch+1}/{num_epochs}")
+                    images_gaze = Variable(images_gaze).cuda(gpu)
+                    
+                    # Binned labels
+                    label_pitch_gaze = Variable(labels_gaze[:, 0]).cuda(gpu)
+                    label_yaw_gaze = Variable(labels_gaze[:, 1]).cuda(gpu)
 
-                # Continuous labels
-                label_pitch_cont_gaze = Variable(cont_labels_gaze[:, 0]).cuda(gpu)
-                label_yaw_cont_gaze = Variable(cont_labels_gaze[:, 1]).cuda(gpu)
+                    # Continuous labels
+                    label_pitch_cont_gaze = Variable(cont_labels_gaze[:, 0]).cuda(gpu)
+                    label_yaw_cont_gaze = Variable(cont_labels_gaze[:, 1]).cuda(gpu)
 
-                pitch, yaw = model(images_gaze)
+                    pitch, yaw = model(images_gaze)
 
-                # Cross entropy loss
-                loss_pitch_gaze = criterion(pitch, label_pitch_gaze)
-                loss_yaw_gaze = criterion(yaw, label_yaw_gaze)
+                    # Cross entropy loss
+                    loss_pitch_gaze = criterion(pitch, label_pitch_gaze)
+                    loss_yaw_gaze = criterion(yaw, label_yaw_gaze)
 
-                # MSE loss
-                pitch_predicted = softmax(pitch)
-                yaw_predicted = softmax(yaw)
+                    # MSE loss
+                    pitch_predicted = softmax(pitch)
+                    yaw_predicted = softmax(yaw)
 
-                pitch_predicted = \
-                    torch.sum(pitch_predicted * idx_tensor, 1) * 4 - 180
-                yaw_predicted = \
-                    torch.sum(yaw_predicted * idx_tensor, 1) * 4 - 180
+                    pitch_predicted = torch.sum(pitch_predicted * idx_tensor, 1) * 4 - 180
+                    yaw_predicted = torch.sum(yaw_predicted * idx_tensor, 1) * 4 - 180
 
-                loss_reg_pitch = reg_criterion(
-                    pitch_predicted, label_pitch_cont_gaze)
-                loss_reg_yaw = reg_criterion(
-                    yaw_predicted, label_yaw_cont_gaze)
+                    loss_reg_pitch = reg_criterion(
+                        pitch_predicted, label_pitch_cont_gaze)
+                    loss_reg_yaw = reg_criterion(
+                        yaw_predicted, label_yaw_cont_gaze)
 
-                # Total loss
-                loss_pitch_gaze += alpha * loss_reg_pitch
-                loss_yaw_gaze += alpha * loss_reg_yaw
+                    # Total loss
+                    loss_pitch_gaze += alpha * loss_reg_pitch
+                    loss_yaw_gaze += alpha * loss_reg_yaw
 
-                sum_loss_pitch_gaze += loss_pitch_gaze
-                sum_loss_yaw_gaze += loss_yaw_gaze
+                    interval_loss_pitch_gaze += loss_pitch_gaze.item()
+                    interval_loss_yaw_gaze += loss_yaw_gaze.item()
+                    epoch_loss_pitch_gaze += loss_pitch_gaze.item()
+                    epoch_loss_yaw_gaze += loss_yaw_gaze.item()
 
-                loss_seq = [loss_pitch_gaze, loss_yaw_gaze]
-                grad_seq = [torch.tensor(1.0).cuda(gpu) for _ in range(len(loss_seq))]
-                optimizer_gaze.zero_grad(set_to_none=True)
-                torch.autograd.backward(loss_seq, grad_seq)
-                optimizer_gaze.step()
-                # scheduler.step()
-                
-                iter_gaze += 1
+                    # loss_seq = [loss_pitch_gaze, loss_yaw_gaze]
+                    # grad_seq = [torch.tensor(1.0).cuda(gpu) for _ in range(len(loss_seq))]
+                    # optimizer_gaze.zero_grad(set_to_none=True)
+                    # torch.autograd.backward(loss_seq, grad_seq)
+                    # optimizer_gaze.step()
 
-                if (i+1) % 100 == 0:
-                    print('Epoch [%d/%d], Iter [%d/%d] Losses: '
-                        'Gaze Yaw %.4f,Gaze Pitch %.4f' % (
-                            epoch+1,
-                            num_epochs,
-                            i+1,
-                            len(dataset)//batch_size,
-                            sum_loss_pitch_gaze/iter_gaze,
-                            sum_loss_yaw_gaze/iter_gaze
-                        )
-                        )
+                    # How about this?
+                    loss = loss_pitch_gaze + loss_yaw_gaze
+                    optimizer_gaze.zero_grad(set_to_none=True)
+                    loss.backward()
+                    optimizer_gaze.step()
+                    # scheduler.step()
+                    # tepoch.set_postfix(loss_yaw=f"{loss_pitch_gaze.item():4.3f}", loss_pitch=f"{loss_yaw_gaze.item():4.3f}"
+
+                    if (iter_gaze+1) % 100 == 0:
+                        logger.info('Epoch [%d/%d], Iter [%d/%d] Avg Loss: '
+                            'Gaze Pitch %.4f, Gaze Yaw %.4f' % (
+                                epoch+1, num_epochs, 
+                                iter_gaze+1, num_batches,
+                                interval_loss_pitch_gaze/interval,
+                                interval_loss_yaw_gaze/interval
+                            ))
+                        interval_loss_pitch_gaze = interval_loss_yaw_gaze = 0
                     
             if epoch % 1 == 0 and epoch < num_epochs:
-                print('Taking snapshot...',
-                    torch.save(model.state_dict(),
-                                output +'/'+
-                                '_epoch_' + str(epoch+1) + '.pkl')
-                    )
+                logger.info('Epoch [%d/%d], Avg Loss: Gaze Pitch %.4f, Gaze Yaw %.4f' % (
+                    epoch+1, num_epochs, 
+                    epoch_loss_pitch_gaze/num_batches, 
+                    epoch_loss_yaw_gaze/num_batches))
+                output_pkl = os.path.join(output, 'epoch_' + str(epoch+1) + '.pkl')
+                logger.info(f'Taking snapshot at {output_pkl}')
+                torch.save(model.state_dict(), output_pkl)
             
 
     # mpiigaze
