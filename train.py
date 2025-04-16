@@ -460,8 +460,14 @@ if __name__ == '__main__':
 
                 # Save models at numbered epochs.
                 if epoch % 1 == 0 and epoch < num_epochs:
+                    model.eval() #모델 평가모드
+                    quantized_model = torch.quantization.quantize_dynamic(
+                        model,  # 원본 모델
+                        {nn.Linear},  # 양자화할 모듈 종류 (여기선 Linear만)
+                        dtype=torch.qint8  # 8-bit 정수형으로 양자화
+                    )
                     print('Taking snapshot...',
-                        torch.save(model.state_dict(),
+                        torch.save(quantized_model.state_dict(),
                                     # output+'/fold' + str(fold) +'/'+
                                     output+'fold' + str(fold) +'/'+
                                     '_epoch_' + str(epoch+1) + '.pkl')

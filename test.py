@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 from torchvision import transforms
 import torch.backends.cudnn as cudnn
 import torchvision
+import time
 
 from l2cs import select_device, natural_keys, gazeto3d, angular, getArch, L2CS, Gaze360, Mpiigaze
 
@@ -30,6 +31,14 @@ def parse_args():
     parser.add_argument(
         '--gazeMpiilabel_dir', dest='gazeMpiilabel_dir', help='Directory path for gaze labels.',
         default='datasets/MPIIFaceGaze/Label', type=str)
+    # temp bin setting
+    parser.add_argument(
+    '--bins', dest='bins', help='각도를 나눌 bin 수', default=90, type=int)
+    parser.add_argument(
+    '--angle', dest='angle', help='MPIIFaceGaze에서 사용할 최대 각도 범위', default=180, type=int)
+    parser.add_argument(
+    '--bin_width', dest='bin_width', help='각도 bin 하나당 범위', default=4, type=int)
+
     # Important args -------------------------------------------------------------------------------------------------------
     # ----------------------------------------------------------------------------------------------------------------------
     parser.add_argument(
@@ -125,22 +134,42 @@ if __name__ == '__main__':
             avg_yaw=[]
             avg_pitch=[]
             avg_MAE=[]
+            
+            # Base network structure
             for epochs in folder:
-                # Base network structure
-                model=getArch(arch, 90)
-                saved_state_dict = torch.load(os.path.join(snapshot_path, epochs))
-                model.load_state_dict(saved_state_dict)
-                model.cuda(gpu)
-                model.eval()
+                model_path = os.path.join(snapshot_path, epochs)
+                is_quant = 'quant' in model_path.lower()
+                # 모델 이름에서 양자화된 모델을 확인
+                if is_quant:  # 모델이 양자화된 경우
+                    model = torch.load(model_path)  # 전체 모델을 불러옴
+                    device = torch.device("cpu")
+                    model = model.to(device)  # 모델을 CPU 또는 GPU로 이동
+                else:  # 일반 모델인 경우
+                    model = getArch(arch, 90)  # 기본 아키텍처로 모델 생성
+                    state_dict = torch.load(model_path)
+                    model.load_state_dict(state_dict)  # 모델 파라미터 로드
+                    model.cuda(gpu)
+
+                
+                
+                model.eval()  # 평가 모드로 설정
                 total = 0
                 idx_tensor = [idx for idx in range(90)]
-                idx_tensor = torch.FloatTensor(idx_tensor).cuda(gpu)
+                if not is_quant:
+                    idx_tensor = torch.FloatTensor(idx_tensor).cuda(gpu)
+                else:
+                    idx_tensor = torch.FloatTensor(idx_tensor)
                 avg_error = .0
                 
-                
+                start_time = time.time()  # 시작 시간 기록
+
                 with torch.no_grad():           
                     for j, (images, labels, cont_labels, name) in enumerate(test_loader):
-                        images = Variable(images).cuda(gpu)
+                        if not is_quant:
+                            images = images.cuda(gpu)
+                        else:
+                            images = images.cpu()
+                        images = Variable(images)
                         total += cont_labels.size(0)
 
                         label_pitch = cont_labels[:,0].float()*np.pi/180
@@ -168,12 +197,14 @@ if __name__ == '__main__':
                         for p,y,pl,yl in zip(pitch_predicted,yaw_predicted,label_pitch,label_yaw):
                             avg_error += angular(gazeto3d([p,y]), gazeto3d([pl,yl]))
                         
-        
+                    end_time = time.time()  # 종료 시간 기록
+                    elapsed_time = end_time - start_time
+                    fps = total / elapsed_time
                     
                 x = ''.join(filter(lambda i: i.isdigit(), epochs))
                 epoch_list.append(x)
                 avg_MAE.append(avg_error/total)
-                loger = f"[{epochs}---{args.dataset}] Total Num:{total},MAE:{avg_error/total}\n"
+                loger = f"[{epochs}---{args.dataset}] Total Num:{total},MAE:{avg_error/total},FPS:{fps:.2f}\n"
                 outfile.write(loger)
                 print(loger)
         
@@ -181,8 +212,9 @@ if __name__ == '__main__':
         plt.xlabel('epoch')
         plt.ylabel('avg')
         plt.title('Gaze angular error')
-        plt.legend()
         plt.plot(epoch_list, avg_MAE, color='k', label='mae')
+        plt.legend()
+        
         fig.savefig(os.path.join(evalpath,data_set+".png"), format='png')
         plt.show()
 
@@ -275,9 +307,11 @@ if __name__ == '__main__':
             plt.xlabel('epoch')
             plt.ylabel('avg')
             plt.title('Gaze angular error')
-            plt.legend()
             plt.plot(epoch_list, avg_MAE, color='k', label='mae')
+            plt.legend()
+            
             fig.savefig(os.path.join(evalpath, os.path.join("fold"+str(fold), data_set+".png")), format='png')
+            
             # plt.show()
 
             
